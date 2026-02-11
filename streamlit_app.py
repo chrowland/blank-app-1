@@ -16,6 +16,8 @@ import hashlib
 from dataclasses import dataclass
 from datetime import date
 from typing import Dict, List, Optional, Tuple
+from uuid import uuid4
+
 
 import numpy as np
 import pandas as pd
@@ -54,7 +56,60 @@ def fmt_pct(x: float) -> str:
 def ensure_session_defaults():
     if "model" not in st.session_state:
         st.session_state.model = default_model()
+    if "versions" not in st.session_state:
+        st.session_state.versions = []  # list of dict snapshots
 
+def snapshot_version(model: Model, label: str, notes: str = "", approved: bool = False) -> dict:
+    return {
+        "version_id": str(uuid4()),
+        "label": label,
+        "notes": notes,
+        "approved": approved,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "model": copy.deepcopy(model),
+    }
+
+
+def flatten_assumptions_for_diff(model: Model) -> pd.DataFrame:
+    """Flatten base + scenario overrides into a long table for diffing."""
+    rows = []
+    # base
+    for k, display, cat, unit, dtype, _ in ASSUMPTION_META:
+        v = model.assumptions_base.get(k)
+        if dtype == "scalar":
+            rows.append({"scope": "base", "scenario": "Base", "assumption_key": k, "value": _scalar_to_exportable(v)})
+        else:
+            # summarize TS as Y1 sum (diff-friendly)
+            if isinstance(v, pd.Series):
+                rows.append({"scope": "base", "scenario": "Base", "assumption_key": k, "value": float(v.iloc[:12].sum(skipna=True))})
+            else:
+                rows.append({"scope": "base", "scenario": "Base", "assumption_key": k, "value": np.nan})
+
+    # overrides
+    for scen, ov in model.assumptions_override.items():
+        for k, v in ov.items():
+            if isinstance(v, pd.Series):
+                rows.append({"scope": "override", "scenario": scen, "assumption_key": k, "value": float(v.iloc[:12].sum(skipna=True))})
+            else:
+                rows.append({"scope": "override", "scenario": scen, "assumption_key": k, "value": _scalar_to_exportable(v)})
+    return pd.DataFrame(rows)
+
+def compute_headcount_by_role(model: Model, timeline: pd.DatetimeIndex) -> pd.DataFrame:
+    plan = model.headcount_plan.copy()
+    plan["start_month"] = plan["start_month"].apply(lambda x: month_start(pd.Timestamp(x)))
+
+    roles = sorted(plan["role"].unique().tolist())
+    hc = pd.DataFrame(0.0, index=timeline, columns=roles)
+
+    for role in roles:
+        rows = plan[plan["role"] == role].sort_values("start_month")
+        s = pd.Series(0.0, index=timeline)
+        for _, r in rows.iterrows():
+            start = pd.Timestamp(r["start_month"])
+            if start in s.index:
+                s.loc[start:] += float(r["headcount"])
+        hc[role] = s
+    return hc
 
 # -----------------------------
 # Model structures
@@ -313,6 +368,110 @@ def compute_financials(model: Model, scenario: str) -> Tuple[pd.DataFrame, pd.Da
 
     return pnl, cash, kpis, drivers
 
+def build_trace(model: Model, scenario: str, line_item: str, view: str, period: pd.Timestamp) -> pd.DataFrame:
+    """
+    Returns a table explaining a line item for the selected period.
+    view: Monthly/Quarterly/Annual
+    period: the index value from the rolled table
+    """
+    tl = make_timeline(model.start_month, model.horizon_months)
+    A = resolve_all(model, scenario, tl)
+
+    # Build monthly primitives (same as compute_financials)
+    new_units = A["demand.new_units"]
+    conv = float(A["demand.conversion_rate"])
+    units = new_units * conv
+    price = A["pricing.price_per_unit"]
+    discount = float(A["pricing.discount_rate"])
+    revenue = units * price * (1.0 - discount)
+
+    cogs_pct = float(A["varcost.cogs_pct_revenue"])
+    proc_pct = float(A["varcost.processing_pct_revenue"])
+    svc_per_unit = float(A["varcost.service_cost_per_unit"])
+
+    cogs = revenue * cogs_pct
+    processing = revenue * proc_pct
+    service = units * svc_per_unit
+
+    tools = A["opex.tools"]
+    mkt_nl = A["opex.marketing_non_labor"]
+    hc_by_role = compute_headcount_by_role(model, tl)
+    cost_by_role = model.loaded_cost_by_role.set_index("role")["loaded_cost_per_month"].astype(float)
+    labor_by_role = hc_by_role.mul(cost_by_role, axis=1).fillna(0.0)
+    labor = labor_by_role.sum(axis=1)
+
+    # pick which months to aggregate
+    if view == "Monthly":
+        mask = (tl == period)
+    elif view == "Quarterly":
+        # period is quarter start (QS)
+        q_start = period
+        q_end = (q_start + pd.offsets.QuarterBegin(1))
+        mask = (tl >= q_start) & (tl < q_end)
+    else:  # Annual (YS)
+        y_start = period
+        y_end = (y_start + pd.offsets.YearBegin(1))
+        mask = (tl >= y_start) & (tl < y_end)
+
+    def agg(s: pd.Series) -> float:
+        return float(pd.Series(s, index=tl)[mask].sum(skipna=True))
+
+    rows = []
+
+    if line_item == "pnl.revenue":
+        rows += [
+            {"component": "Units (after conversion)", "value": agg(units), "unit": "count", "formula": "new_units × conversion_rate"},
+            {"component": "Avg price", "value": float(pd.Series(price, index=tl)[mask].mean()), "unit": "$/unit", "formula": "price_per_unit"},
+            {"component": "Discount rate", "value": discount, "unit": "%", "formula": "discount_rate"},
+            {"component": "Revenue", "value": agg(revenue), "unit": "$", "formula": "units × price × (1 - discount)"},
+        ]
+
+    elif line_item in ("pnl.cogs", "pnl.processing", "pnl.service", "pnl.variable_costs"):
+        rows += [
+            {"component": "Revenue", "value": agg(revenue), "unit": "$", "formula": "from revenue build"},
+            {"component": "COGS %", "value": cogs_pct, "unit": "%", "formula": "cogs_pct_revenue"},
+            {"component": "Processing %", "value": proc_pct, "unit": "%", "formula": "processing_pct_revenue"},
+            {"component": "Service $/unit", "value": svc_per_unit, "unit": "$/unit", "formula": "service_cost_per_unit"},
+            {"component": "COGS", "value": agg(cogs), "unit": "$", "formula": "revenue × cogs_pct"},
+            {"component": "Processing", "value": agg(processing), "unit": "$", "formula": "revenue × proc_pct"},
+            {"component": "Service", "value": agg(service), "unit": "$", "formula": "units × service_cost_per_unit"},
+            {"component": "Variable costs (total)", "value": agg(cogs + processing + service), "unit": "$", "formula": "COGS + Processing + Service"},
+        ]
+
+    elif line_item == "pnl.labor":
+        # show labor by role
+        for role in labor_by_role.columns:
+            v = agg(labor_by_role[role])
+            if abs(v) > 1e-6:
+                rows.append({"component": f"Labor – {role}", "value": v, "unit": "$", "formula": "headcount × loaded_cost"})
+        rows.append({"component": "Labor (total)", "value": agg(labor), "unit": "$", "formula": "sum roles"})
+
+    elif line_item in ("pnl.tools", "pnl.marketing_non_labor"):
+        if line_item == "pnl.tools":
+            rows.append({"component": "Tools / vendors", "value": agg(tools), "unit": "$", "formula": "tools timeseries"})
+        else:
+            rows.append({"component": "Marketing (non-labor)", "value": agg(mkt_nl), "unit": "$", "formula": "marketing_non_labor timeseries"})
+
+    elif line_item == "pnl.ebitda":
+        # rebuild pieces
+        variable_total = cogs + processing + service
+        gross_profit = revenue - variable_total
+        ebitda = gross_profit - (labor + tools + mkt_nl)
+
+        rows += [
+            {"component": "Revenue", "value": agg(revenue), "unit": "$", "formula": "units × price × (1 - discount)"},
+            {"component": "Variable costs", "value": agg(variable_total), "unit": "$", "formula": "COGS + Processing + Service"},
+            {"component": "Gross profit", "value": agg(gross_profit), "unit": "$", "formula": "Revenue - Variable costs"},
+            {"component": "Labor", "value": agg(labor), "unit": "$", "formula": "sum roles"},
+            {"component": "Tools", "value": agg(tools), "unit": "$", "formula": "tools"},
+            {"component": "Marketing (non-labor)", "value": agg(mkt_nl), "unit": "$", "formula": "marketing_non_labor"},
+            {"component": "EBITDA", "value": agg(ebitda), "unit": "$", "formula": "Gross profit - Opex"},
+        ]
+    else:
+        rows.append({"component": "Trace not implemented for this line yet", "value": np.nan, "unit": "", "formula": ""})
+
+    out = pd.DataFrame(rows)
+    return out
 
 # -----------------------------
 # UI components
@@ -433,7 +592,7 @@ model: Model = st.session_state.model
 st.sidebar.title("New LOB Model Factory (V1)")
 page = st.sidebar.radio(
     "Navigate",
-    ["Overview", "Assumptions", "Revenue Drivers", "Costs & Headcount", "Financial Statements", "Cash & Runway", "Scenarios", "Sensitivities", "Export"],
+    ["Overview", "Assumptions", "Revenue Drivers", "Costs & Headcount", "Financial Statements", "Cash & Runway", "Scenarios", "Sensitivities", "Versioning & Audit", "Export"],
 )
 
 st.sidebar.divider()
@@ -667,23 +826,30 @@ elif page == "Financial Statements":
 
     st.dataframe(display, use_container_width=True)
 
-    st.subheader("Line-item trace (V1: formula + key assumptions)")
-    line = st.selectbox("Select line", [k for k, _, _ in PNL_LINES])
-    if line == "pnl.revenue":
-        st.markdown(
-            "- `revenue = (new_units × conversion_rate) × price_per_unit × (1 - discount_rate)`\n"
-            "- Key assumptions: `demand.new_units`, `demand.conversion_rate`, `pricing.price_per_unit`, `pricing.discount_rate`"
-        )
-    elif line in ("pnl.cogs", "pnl.processing", "pnl.service"):
-        st.markdown(
-            "- `cogs = revenue × cogs_pct_revenue`\n"
-            "- `processing = revenue × processing_pct_revenue`\n"
-            "- `service = units × service_cost_per_unit`"
-        )
-    elif line == "pnl.ebitda":
-        st.markdown("- `EBITDA = gross_profit - labor - tools - marketing_non_labor`")
-    else:
-        st.markdown("- V1 trace: see Drivers + Assumptions pages for inputs.")
+    st.subheader("Trace Explorer")
+    roll = st.radio("Trace view", ["Monthly", "Quarterly", "Annual"], horizontal=True)
+    
+    # Build a selectable period index from current pnl view
+    pnl_for_periods = rollup_table(pnl.drop(columns=["pnl.gross_margin"]), roll)
+    period = st.selectbox("Period", pnl_for_periods.index.tolist(), format_func=lambda x: str(pd.Timestamp(x).date()))
+    
+    line = st.selectbox("Line item", [k for k, _, _ in PNL_LINES])
+    
+    trace_df = build_trace(model, scenario, line, roll, pd.Timestamp(period))
+    
+    # Format
+    def _fmt_row(row):
+        if row["unit"] == "$":
+            return fmt_money(row["value"])
+        if row["unit"] == "%":
+            return fmt_pct(row["value"])
+        if row["unit"] == "count":
+            return f"{row['value']:,.0f}"
+        return str(row["value"])
+    
+    show = trace_df.copy()
+    show["value"] = show.apply(_fmt_row, axis=1)
+    st.dataframe(show[["component","value","unit","formula"]], use_container_width=True)
 
 elif page == "Cash & Runway":
     st.title("Cash & Runway")
@@ -815,6 +981,68 @@ elif page == "Sensitivities":
     st.write(f"Baseline ({scenario}) **{target_metric}**: {fmt_money(base_val) if 'Revenue' in target_metric or 'EBITDA' in target_metric or 'burn' in target_metric else base_val}")
 
     st.dataframe(res.assign(delta=lambda d: d["metric"] - base_val), use_container_width=True)
+
+elif page == "Versioning & Audit":
+    st.title("Versioning & Audit")
+
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        label = st.text_input("Version label", value=f"v{len(st.session_state.versions)+1} – draft")
+        notes = st.text_area("Notes", value="")
+    with c2:
+        approved = st.checkbox("Mark as approved", value=False)
+        if st.button("Save version snapshot"):
+            st.session_state.versions.append(snapshot_version(model, label=label, notes=notes, approved=approved))
+            st.success("Saved version snapshot.")
+
+    st.divider()
+
+    if len(st.session_state.versions) == 0:
+        st.info("No versions saved yet.")
+    else:
+        versions_df = pd.DataFrame(
+            [{
+                "label": v["label"],
+                "approved": v["approved"],
+                "created_at": v["created_at"],
+                "notes": v["notes"],
+                "version_id": v["version_id"],
+            } for v in st.session_state.versions]
+        ).sort_values("created_at", ascending=False)
+
+        st.subheader("Saved versions")
+        st.dataframe(versions_df.drop(columns=["version_id"]), use_container_width=True)
+
+        pick = st.selectbox("Select a version to restore / diff", versions_df["label"].tolist())
+        chosen = next(v for v in st.session_state.versions if v["label"] == pick)
+
+        colA, colB = st.columns(2)
+        with colA:
+            if st.button("Restore selected version"):
+                st.session_state.model = copy.deepcopy(chosen["model"])
+                st.success("Restored.")
+                st.rerun()
+        with colB:
+            st.caption("Tip: restore will overwrite current in-memory model.")
+
+        st.subheader("Assumption diff (current vs selected)")
+        current_flat = flatten_assumptions_for_diff(model)
+        chosen_flat = flatten_assumptions_for_diff(chosen["model"])
+
+        merged = current_flat.merge(
+            chosen_flat,
+            on=["scope", "scenario", "assumption_key"],
+            how="outer",
+            suffixes=("_current", "_selected"),
+        )
+
+        merged["changed"] = merged["value_current"].astype(str) != merged["value_selected"].astype(str)
+        diff = merged[merged["changed"]].copy()
+        diff = diff.sort_values(["scenario", "scope", "assumption_key"])
+
+        st.dataframe(diff[["scope","scenario","assumption_key","value_selected","value_current"]], use_container_width=True)
+
+
 
 elif page == "Export":
     st.title("Export")
