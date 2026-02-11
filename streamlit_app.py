@@ -340,6 +340,23 @@ def rollup_table(df: pd.DataFrame, mode: str) -> pd.DataFrame:
     return out
 
 
+def _scalar_to_exportable(x):
+    """Return a safe, human-friendly scalar for Excel."""
+    if x is None:
+        return np.nan
+    # pandas / numpy scalar
+    if isinstance(x, (np.generic,)):
+        x = x.item()
+    # numeric
+    if isinstance(x, (int, float, np.number)) and not isinstance(x, bool):
+        return float(x)
+    # bool
+    if isinstance(x, (bool, np.bool_)):
+        return bool(x)
+    # everything else (strings, etc.)
+    return str(x)
+
+
 def export_to_excel(model: Model, scenario: str) -> bytes:
     pnl, cash, kpis, drivers = compute_financials(model, scenario)
     tl = pnl.index
@@ -356,6 +373,7 @@ def export_to_excel(model: Model, scenario: str) -> bytes:
     for k, display, cat, unit, dtype, _ in ASSUMPTION_META:
         base = model.assumptions_base.get(k)
         ov = model.assumptions_override.get(scenario, {}).get(k)
+
         if dtype == "scalar":
             rows.append(
                 {
@@ -364,15 +382,16 @@ def export_to_excel(model: Model, scenario: str) -> bytes:
                     "category": cat,
                     "unit": unit,
                     "type": dtype,
-                    "base_value": float(base) if base is not None else np.nan,
-                    "scenario_value": float(ov) if ov is not None else np.nan,
+                    "base_value": _scalar_to_exportable(base),
+                    "scenario_value": _scalar_to_exportable(ov) if ov is not None else np.nan,
                 }
             )
         else:
-            # summarize timeseries
-            base_y1 = float(base.reindex(tl).iloc[:12].sum())
+            # timeseries: export year-1 sum as summary + allow full series in separate sheets if desired
+            base_series = base.reindex(tl) if isinstance(base, pd.Series) else pd.Series(np.nan, index=tl)
             scen_series = resolve_assumption(model, scenario, k, tl)
-            scen_y1 = float(pd.Series(scen_series, index=tl).iloc[:12].sum())
+            scen_series = pd.Series(scen_series, index=tl)
+
             rows.append(
                 {
                     "assumption_key": k,
@@ -380,10 +399,11 @@ def export_to_excel(model: Model, scenario: str) -> bytes:
                     "category": cat,
                     "unit": unit,
                     "type": dtype,
-                    "base_value": base_y1,
-                    "scenario_value": scen_y1,
+                    "base_value": float(base_series.iloc[:12].sum(skipna=True)),
+                    "scenario_value": float(scen_series.iloc[:12].sum(skipna=True)),
                 }
             )
+
     assumptions_summary = pd.DataFrame(rows)
 
     buf = io.BytesIO()
@@ -400,6 +420,7 @@ def export_to_excel(model: Model, scenario: str) -> bytes:
         model.loaded_cost_by_role.to_excel(writer, index=False, sheet_name="Loaded_Costs")
 
     return buf.getvalue()
+
 
 
 # -----------------------------
