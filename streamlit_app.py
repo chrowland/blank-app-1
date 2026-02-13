@@ -566,7 +566,7 @@ def export_to_excel(model: Model, scenario: str) -> bytes:
     assumptions_summary = pd.DataFrame(rows)
 
     buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+    with pd.ExcelWriter(buf) as writer:
         meta.to_excel(writer, index=False, sheet_name="Meta")
         pd.DataFrame({"metric": list(kpis.keys()), "value": list(kpis.values())}).to_excel(
             writer, index=False, sheet_name="KPIs"
