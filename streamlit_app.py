@@ -589,6 +589,16 @@ st.set_page_config(page_title="New LOB Model Factory (V1)", layout="wide")
 ensure_session_defaults()
 model: Model = st.session_state.model
 
+st.sidebar.divider()
+if st.sidebar.button("Reset model to defaults"):
+    st.session_state.model = default_model()
+    # If you added approval flags earlier:
+    st.session_state.current_approved = False
+    st.session_state.current_approved_by = ""
+    st.session_state.current_approved_at = ""
+    st.sidebar.success("Reset.")
+    st.rerun()
+
 st.sidebar.title("New LOB Model Factory (V1)")
 page = st.sidebar.radio(
     "Navigate",
